@@ -5,7 +5,7 @@ This folder contains a lightweight solution script for the Kaggle competition **
 ## What’s included
 
 - `mallorn_improved.py` — feature extraction + model training + submission generation
-- `submissions/submission_ready_improved.csv` — an upload-ready Kaggle submission file
+- `submissions/submission.csv` — an upload-ready Kaggle submission file
 
 Large Kaggle data files are intentionally excluded from git via `.gitignore`.
 
@@ -20,7 +20,7 @@ Large Kaggle data files are intentionally excluded from git via `.gitignore`.
 python3 mallorn_improved.py
 ```
 
-It will write `submission_improved.csv` in the current folder.
+It will write `submission.csv` in the current folder.
 
 ## How to submit
 
@@ -31,4 +31,4 @@ Upload the generated CSV to Kaggle. The required format is:
 
 You can also upload the provided final file:
 
-- `submissions/submission_ready_improved.csv`
+- `submissions/submission.csv`

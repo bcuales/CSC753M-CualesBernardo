@@ -427,7 +427,7 @@ def main() -> None:
     test_pred = (test_proba >= cv.best_threshold).astype(np.int8)
 
     sub = pd.DataFrame({"object_id": test_log["object_id"].astype(str), "prediction": test_pred})
-    out_path = Path("submission_improved.csv")
+    out_path = Path("submission.csv")
     sub.to_csv(out_path, index=False)
     print(f"Wrote: {out_path.resolve()}")
 
