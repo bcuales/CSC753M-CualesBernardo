@@ -63,6 +63,82 @@ def _safe_kurt(s: pd.Series) -> float:
     return float(v.kurt())
 
 
+def _skew_np(x: np.ndarray) -> float:
+    x = x.astype(np.float64, copy=False)
+    if x.size < 3:
+        return 0.0
+    m = float(np.mean(x))
+    s = float(np.std(x))
+    if not np.isfinite(s) or s == 0.0:
+        return 0.0
+    z = (x - m) / s
+    return float(np.mean(z**3))
+
+
+def _kurt_np(x: np.ndarray) -> float:
+    x = x.astype(np.float64, copy=False)
+    if x.size < 4:
+        return 0.0
+    m = float(np.mean(x))
+    s = float(np.std(x))
+    if not np.isfinite(s) or s == 0.0:
+        return 0.0
+    z = (x - m) / s
+    return float(np.mean(z**4) - 3.0)
+
+
+def _resample_linear(t: np.ndarray, x: np.ndarray, n_grid: int = 64) -> tuple[np.ndarray, float]:
+    """Resample (t, x) to a uniform grid via linear interpolation.
+
+    Returns (x_grid, dt) where dt is the grid spacing in the same units as t.
+    """
+    t = t.astype(np.float64, copy=False)
+    x = x.astype(np.float64, copy=False)
+    if t.size < 2:
+        return np.full(n_grid, float(x[0]) if x.size else 0.0, dtype=np.float64), 1.0
+
+    t0 = float(np.nanmin(t))
+    t1 = float(np.nanmax(t))
+    if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+        return np.full(n_grid, float(np.nanmean(x)) if x.size else 0.0, dtype=np.float64), 1.0
+
+    order = np.argsort(t)
+    tt = t[order]
+    xx = x[order]
+
+    # de-duplicate time points (np.interp expects increasing x)
+    uniq_t, uniq_idx = np.unique(tt, return_index=True)
+    uniq_x = xx[uniq_idx]
+
+    grid = np.linspace(t0, t1, n_grid)
+    x_grid = np.interp(grid, uniq_t, uniq_x)
+    dt = (t1 - t0) / max(n_grid - 1, 1)
+    return x_grid.astype(np.float64, copy=False), float(dt)
+
+
+def _linear_regression_1d(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+    """Return (slope, intercept, r2) for y ~ a + b x."""
+    x = x.astype(np.float64, copy=False)
+    y = y.astype(np.float64, copy=False)
+    if x.size < 2:
+        return 0.0, float(np.mean(y) if y.size else 0.0), 0.0
+
+    xm = float(np.mean(x))
+    ym = float(np.mean(y))
+    xv = x - xm
+    yv = y - ym
+    den = float(np.sum(xv * xv))
+    if not np.isfinite(den) or den == 0.0:
+        return 0.0, ym, 0.0
+    slope = float(np.sum(xv * yv) / den)
+    intercept = float(ym - slope * xm)
+    y_hat = intercept + slope * x
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - ym) ** 2))
+    r2 = 0.0 if ss_tot == 0.0 else float(1.0 - ss_res / ss_tot)
+    return slope, intercept, r2
+
+
 def _weighted_mean(x: pd.Series, err: pd.Series) -> float:
     w = 1.0 / (err.replace(0, np.nan) ** 2)
     num = (w * x).sum(skipna=True)
@@ -142,22 +218,147 @@ def extract_lightcurve_features(lightcurves: pd.DataFrame, ebv_map: pd.Series | 
     skew = gf["Flux_corr"].apply(_safe_skew).rename("flux_skew")
     kurt = gf["Flux_corr"].apply(_safe_kurt).rename("flux_kurt")
 
-    # Peak timing & simple rise/decay rates
-    def _peak_features(g: pd.DataFrame) -> pd.Series:
+    # Peak timing + physics-ish shape/fit features inspired by top solutions
+    def _advanced_features(g: pd.DataFrame) -> pd.Series:
         gg = g.sort_values("t0")
-        t_start = float(gg["t0"].iloc[0])
-        t_end = float(gg["t0"].iloc[-1])
-        f_start = float(gg["Flux_corr"].iloc[0])
-        f_end = float(gg["Flux_corr"].iloc[-1])
-        idx_max = int(gg["Flux_corr"].to_numpy().argmax())
-        t_peak = float(gg["t0"].iloc[idx_max])
-        f_peak = float(gg["Flux_corr"].iloc[idx_max])
+        t = gg["t0"].to_numpy(dtype=np.float64)
+        f = gg["Flux_corr"].to_numpy(dtype=np.float64)
+        e = gg["Flux_err_corr"].to_numpy(dtype=np.float64)
+        snr = gg["snr_corr"].to_numpy(dtype=np.float64)
+
+        t_start = float(t[0])
+        t_end = float(t[-1])
+        f_start = float(f[0])
+        f_end = float(f[-1])
+        if f.size and np.isfinite(f).any():
+            f_peak_idx = int(np.argmax(np.where(np.isfinite(f), f, -np.inf)))
+            idx_max = f_peak_idx
+            t_peak = float(t[idx_max])
+            f_peak = float(f[idx_max]) if np.isfinite(f[idx_max]) else 0.0
+        else:
+            idx_max = 0
+            t_peak = float(t[0]) if t.size else 0.0
+            f_peak = 0.0
+
         eps = 1e-6
         rise = (f_peak - f_start) / max(t_peak - t_start, eps)
         decay = (f_end - f_peak) / max(t_end - t_peak, eps)
-        return pd.Series({"t_peak": t_peak, "f_start": f_start, "f_end": f_end, "rise_rate": rise, "decay_rate": decay})
 
-    peak = gf.apply(_peak_features)
+        # Negative flux diagnostics (use significance when possible)
+        e_safe = np.where(np.isfinite(e) & (e > 0), e, np.nan)
+        neg_sig = f < (-3.0 * e_safe)
+        neg_sig_frac = float(np.nanmean(neg_sig)) if neg_sig.size else 0.0
+        neg_frac = float(np.mean(f < 0.0)) if f.size else 0.0
+
+        # Physical binning relative to the peak (captures rise/decay morphology)
+        # (chosen to be coarse + stable; avoids overfitting)
+        rel = t - t_peak
+        edges = np.array([-1e18, -40, -20, -10, -5, 0, 5, 10, 20, 40, 1e18], dtype=np.float64)
+        bin_means: dict[str, float] = {}
+        for i in range(len(edges) - 1):
+            m = (rel >= edges[i]) & (rel < edges[i + 1])
+            if not np.any(m):
+                bin_means[f"phys_bin_{i}_mean"] = 0.0
+                bin_means[f"phys_bin_{i}_n"] = 0.0
+            else:
+                vals = f[m]
+                bin_means[f"phys_bin_{i}_mean"] = float(np.nanmean(vals)) if np.isfinite(vals).any() else 0.0
+                bin_means[f"phys_bin_{i}_n"] = float(np.sum(m))
+
+        # Power-law decay fit post-peak: log(F) ~ a + alpha log(t)
+        post = (rel > 0) & (f > 0) & (snr > 2)
+        if np.sum(post) >= 3:
+            x = np.log(rel[post] + 1.0)
+            y = np.log(f[post])
+            alpha, intercept, r2 = _linear_regression_1d(x, y)
+            powerlaw_alpha = alpha
+            powerlaw_r2 = r2
+            powerlaw_alpha_err = float(abs(alpha - (-5.0 / 3.0)))
+        else:
+            powerlaw_alpha = 0.0
+            powerlaw_r2 = 0.0
+            powerlaw_alpha_err = 0.0
+
+        # Fireball rise fit pre-peak: log(F) ~ a + beta log(dt)
+        pre = (rel < 0) & (f > 0) & (snr > 2)
+        if np.sum(pre) >= 3:
+            dt = -rel[pre]
+            x = np.log(dt + 1.0)
+            y = np.log(f[pre])
+            beta, intercept2, r2b = _linear_regression_1d(x, y)
+            rise_beta = beta
+            rise_r2 = r2b
+            rise_beta_err = float(abs(beta - 2.0))
+        else:
+            rise_beta = 0.0
+            rise_r2 = 0.0
+            rise_beta_err = 0.0
+
+        # Template matching chi^2 (very lightweight): rise~t^2, decay~t^{-5/3}
+        # Scale template to peak flux.
+        if f.size >= 3 and np.isfinite(f_peak) and np.isfinite(t_peak):
+            tmpl = np.ones_like(rel, dtype=np.float64)
+            pre_m = rel < 0
+            post_m = rel > 0
+            tmpl[pre_m] = (np.abs(rel[pre_m]) + 1.0) ** 2.0
+            tmpl[post_m] = (rel[post_m] + 1.0) ** (-5.0 / 3.0)
+            f_hat = f_peak * tmpl
+            w = np.where(np.isfinite(e_safe) & (e_safe > 0), 1.0 / (e_safe**2), 0.0)
+            num = np.sum(w * (f - f_hat) ** 2)
+            den = np.sum(w) + 1e-12
+            template_chisq_tde = float(num / den)
+        else:
+            template_chisq_tde = 0.0
+
+        # Resampled (interpolated) stats + FFT features (captures quasi-periodic variability)
+        xg, dt_grid = _resample_linear(t, f, n_grid=64)
+        xg0 = xg - float(np.mean(xg))
+        resampled_skew = _skew_np(xg)
+        resampled_kurt = _kurt_np(xg)
+        if dt_grid > 0:
+            spec = np.fft.rfft(xg0)
+            pwr = (spec.real**2 + spec.imag**2).astype(np.float64, copy=False)
+            pwr_mean = float(np.mean(pwr))
+            if pwr.size > 1:
+                k = int(np.argmax(pwr[1:]) + 1)
+                dom_power = float(pwr[k])
+                dom_freq = float(k / (xg0.size * dt_grid))
+                dom_power_ratio = float(dom_power / (float(np.sum(pwr)) + 1e-12))
+            else:
+                dom_freq = 0.0
+                dom_power_ratio = 0.0
+        else:
+            pwr_mean = 0.0
+            dom_freq = 0.0
+            dom_power_ratio = 0.0
+
+        return pd.Series(
+            {
+                "t_peak": t_peak,
+                "f_peak": f_peak,
+                "f_start": f_start,
+                "f_end": f_end,
+                "rise_rate": float(rise),
+                "decay_rate": float(decay),
+                "neg_sig_frac": neg_sig_frac,
+                "neg_frac": neg_frac,
+                "powerlaw_alpha": float(powerlaw_alpha),
+                "powerlaw_r2": float(powerlaw_r2),
+                "powerlaw_alpha_err": float(powerlaw_alpha_err),
+                "fireball_beta": float(rise_beta),
+                "fireball_r2": float(rise_r2),
+                "fireball_beta_err": float(rise_beta_err),
+                "template_chisq_tde": template_chisq_tde,
+                "resampled_skew": float(resampled_skew),
+                "resampled_kurt": float(resampled_kurt),
+                "fft_mean_power": float(pwr_mean),
+                "fft_dom_freq": float(dom_freq),
+                "fft_dom_power_ratio": float(dom_power_ratio),
+                **bin_means,
+            }
+        )
+
+    adv = gf.apply(_advanced_features)
 
     # Linear slope in corrected flux vs t0
     sums = gf.agg(
@@ -176,7 +377,7 @@ def extract_lightcurve_features(lightcurves: pd.DataFrame, ebv_map: pd.Series | 
         .join(wmean, how="left")
         .join(skew, how="left")
         .join(kurt, how="left")
-        .join(peak, how="left")
+        .join(adv, how="left")
         .join(slope, how="left")
     )
 
@@ -210,6 +411,21 @@ def extract_lightcurve_features(lightcurves: pd.DataFrame, ebv_map: pd.Series | 
         cb = f"{b}__flux_median"
         if ca in out.columns and cb in out.columns:
             out[f"color_{name}"] = out[ca] - out[cb]
+
+    # Color evolution proxies via physical bins (min/max over bins)
+    # Example: g-r difference computed per bin where both are present.
+    for a, b, nm in [("g", "r", "gr"), ("r", "i", "ri"), ("i", "z", "iz")]:
+        diffs: list[pd.Series] = []
+        for i in range(10):
+            ca = f"{a}__phys_bin_{i}_mean"
+            cb = f"{b}__phys_bin_{i}_mean"
+            if ca in out.columns and cb in out.columns:
+                diffs.append(out[ca] - out[cb])
+        if diffs:
+            mat = np.vstack([d.to_numpy(dtype=np.float64) for d in diffs])
+            out[f"color_{nm}_bin_min"] = np.nanmin(mat, axis=0)
+            out[f"color_{nm}_bin_max"] = np.nanmax(mat, axis=0)
+            out[f"color_{nm}_bin_mean"] = np.nanmean(mat, axis=0)
 
     return out
 
@@ -254,7 +470,9 @@ def build_feature_table(data_dir: Path, kind: str, log_df: pd.DataFrame) -> pd.D
 class CVResult:
     oof_proba: np.ndarray
     best_threshold: float
+    best_threshold_median: float
     cv_f1_at_best_threshold: float
+    cv_f1_at_median_threshold: float
     best_iterations_mean: int | None
 
 
@@ -346,13 +564,22 @@ def _fit_with_optional_early_stopping(model, X_tr, y_tr, X_va, y_va):
     return model, None
 
 
-def cross_validated_oof_proba(X: pd.DataFrame, y: np.ndarray, n_splits: int = 5, seed: int = 42) -> CVResult:
+def cross_validated_oof_and_test_proba(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    X_test: pd.DataFrame,
+    n_splits: int = 5,
+    seed: int = 42,
+) -> tuple[CVResult, np.ndarray]:
     from sklearn.model_selection import StratifiedKFold
 
     X_np = X.to_numpy(dtype=np.float32)
+    X_test_np = X_test.to_numpy(dtype=np.float32)
     oof = np.zeros(len(y), dtype=np.float32)
+    test_sum = np.zeros(X_test_np.shape[0], dtype=np.float32)
 
     best_iters: list[int] = []
+    fold_thresholds: list[float] = []
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X_np, y), start=1):
@@ -360,13 +587,28 @@ def cross_validated_oof_proba(X: pd.DataFrame, y: np.ndarray, n_splits: int = 5,
         model, best_iter = _fit_with_optional_early_stopping(model, X_np[tr_idx], y[tr_idx], X_np[va_idx], y[va_idx])
         proba = model.predict_proba(X_np[va_idx])[:, 1]
         oof[va_idx] = proba.astype(np.float32)
+        fold_thr, _ = _find_best_threshold(y[va_idx], proba)
+        fold_thresholds.append(float(fold_thr))
+
+        test_sum += model.predict_proba(X_test_np)[:, 1].astype(np.float32)
         if best_iter is not None:
             best_iters.append(best_iter)
         print(f"fold {fold}/{n_splits}: done")
 
     thr, f1 = _find_best_threshold(y, oof)
+    thr_med = float(np.median(np.asarray(fold_thresholds, dtype=np.float64))) if fold_thresholds else thr
+    f1_med = _f1_score_np(y, (oof >= thr_med).astype(np.int8))
     mean_best_iter = int(np.mean(best_iters)) if best_iters else None
-    return CVResult(oof_proba=oof, best_threshold=thr, cv_f1_at_best_threshold=f1, best_iterations_mean=mean_best_iter)
+    cv = CVResult(
+        oof_proba=oof,
+        best_threshold=float(thr),
+        best_threshold_median=float(thr_med),
+        cv_f1_at_best_threshold=float(f1),
+        cv_f1_at_median_threshold=float(f1_med),
+        best_iterations_mean=mean_best_iter,
+    )
+    test_mean = test_sum / float(n_splits)
+    return cv, test_mean
 
 
 def train_full_and_predict(X_train: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame, seed: int = 42, n_estimators: int | None = None) -> np.ndarray:
@@ -416,15 +658,16 @@ def main() -> None:
 
     print(f"Train shape: {X_train.shape} | Test shape: {X_test.shape} | Pos rate: {y.mean():.4f}")
 
-    cv = cross_validated_oof_proba(X_train, y, n_splits=5, seed=42)
-    print(f"CV best threshold: {cv.best_threshold:.5f}")
-    print(f"OOF F1 @ best threshold: {cv.cv_f1_at_best_threshold:.5f}")
+    cv, test_proba = cross_validated_oof_and_test_proba(X_train, y, X_test, n_splits=5, seed=42)
+    print(f"CV best threshold (global OOF): {cv.best_threshold:.5f} | OOF F1: {cv.cv_f1_at_best_threshold:.5f}")
+    print(f"CV median fold threshold: {cv.best_threshold_median:.5f} | OOF F1: {cv.cv_f1_at_median_threshold:.5f}")
     if cv.best_iterations_mean is not None:
         print(f"Mean best_iteration (XGB): {cv.best_iterations_mean}")
 
-    print("Training full model + predicting test...")
-    test_proba = train_full_and_predict(X_train, y, X_test, seed=42, n_estimators=cv.best_iterations_mean)
-    test_pred = (test_proba >= cv.best_threshold).astype(np.int8)
+    # Robust choice used by multiple top solutions: median of fold-wise thresholds
+    chosen_thr = cv.best_threshold_median
+    test_pred = (test_proba >= chosen_thr).astype(np.int8)
+    print(f"Predicted positives in test: {int(test_pred.sum())} (threshold={chosen_thr:.5f})")
 
     sub = pd.DataFrame({"object_id": test_log["object_id"].astype(str), "prediction": test_pred})
     out_path = Path("submission.csv")
