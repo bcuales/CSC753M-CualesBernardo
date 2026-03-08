@@ -7,12 +7,12 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 
-# Data (do not commit Kaggle datasets)
-mallorn-astronomical-classification-challenge/
+# Data
 mallorn-astronomical-classification-challenge.zip
 
 # Local experiment outputs
 submission*.csv
+!submission.csv
 
 # Keep final deliverables
 !submissions/
