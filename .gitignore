@@ -1,0 +1,22 @@
+# OS / editor
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# Data (do not commit Kaggle datasets)
+mallorn-astronomical-classification-challenge/
+mallorn-astronomical-classification-challenge.zip
+
+# Local experiment outputs
+submission*.csv
+
+# Keep final deliverables
+!submissions/
+!submissions/*.csv
+
+# Archive (optional)
+archive/
