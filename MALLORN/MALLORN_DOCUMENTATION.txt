@@ -1,0 +1,201 @@
+MALLORN Astronomical Classification Challenge — Documentation
+========================================================
+
+Author/Repo: CSC753M-CualesBernardo (folder: MALLORN/)
+Last updated: 2026-03-09
+
+
+1) Challenge overview
+---------------------
+Goal
+- Given astronomical light curves (time-series flux measurements in LSST-like filters), predict a binary label per object.
+- Output format is a Kaggle-style submission CSV with columns:
+  object_id,prediction
+  where prediction is 0 or 1.
+
+What you are given (typical competition structure)
+- train_log.csv: one row per object with metadata + the training label (column: target)
+- test_log.csv: one row per object with metadata (no target)
+- split_*/train_full_lightcurves.csv and split_*/test_full_lightcurves.csv:
+  time-series measurements for each object, stored across multiple split folders.
+
+Evaluation
+- The script is designed for F1-style thresholding (it explicitly searches for a probability threshold that maximizes F1 on out-of-fold predictions).
+
+
+2) Project layout
+-----------------
+Key files in this folder
+- mallorn.py
+  End-to-end pipeline:
+  (a) locate data
+  (b) build per-object features from light curves
+  (c) train a gradient-boosting model with cross-validation
+  (d) choose a threshold
+  (e) write submission.csv
+
+- mallorn-astronomical-classification-challenge/
+  Expected local data folder layout (also the name of the Kaggle dataset folder).
+
+- submission.csv
+  Example / latest generated submission file.
+
+
+3) Solution summary (what mallorn.py does)
+------------------------------------------
+This solution follows the common winning pattern for time-series tabular competitions:
+
+A) Feature engineering (light curves -> fixed-length vectors)
+- Input expected columns per light-curve CSV:
+  object_id, Time (MJD), Flux, Flux_err, Filter
+- For each (object_id, Filter) group, the code computes stable, mostly distributional features such as:
+  - count, mean, std, min/max, median
+  - quantiles (q05, q25, q75, q95) and derived amplitude/IQR
+  - signal-to-noise summaries (snr_mean, snr_max, count above 3-sigma)
+  - skewness and kurtosis (safe fallbacks when not enough points)
+
+B) Astrophysics-inspired corrections and morphology features
+- Extinction / de-reddening correction (optional):
+  If EBV exists in the metadata logs, flux is corrected per filter using approximate LSST extinction coefficients:
+    A_lambda = coeff(Filter) * EBV
+    Flux_corr = Flux * 10^(0.4 * A_lambda)
+
+- Peak-based morphology features per (object, filter):
+  - peak time and peak flux
+  - rise rate and decay rate relative to the peak
+  - negative-flux diagnostics (fraction of significantly negative points)
+
+- Lightweight template/shape fits:
+  - power-law decay fit post-peak (log-log regression), with r^2
+  - fireball rise fit pre-peak (log-log regression), with r^2
+  - template chi^2 against a coarse rise~t^2 and decay~t^{-5/3} shape
+
+C) Frequency-domain features
+- For each (object, filter), the flux series is resampled onto a uniform time grid via linear interpolation.
+- A real FFT is computed on the zero-mean resampled series.
+- Features include:
+  - mean spectral power
+  - dominant frequency
+  - dominant power ratio
+
+D) Cross-filter “color” features
+- Differences between per-filter medians (e.g., g-r, r-i, i-z, z-y, u-g) are added when available.
+- Additional coarse “color evolution” proxies use peak-relative bins.
+
+E) Metadata features
+- From train_log.csv/test_log.csv, numeric columns like Z, Z_err, EBV are kept when present.
+- Missingness for Z_err is encoded (Z_err_missing).
+- split is kept only as a grouping key for optional grouped CV, and is dropped from the feature matrix.
+
+
+4) Model and training
+---------------------
+Model choice
+- Preferred: XGBoost (XGBClassifier) if installed.
+- Fallback: scikit-learn HistGradientBoostingClassifier if XGBoost is unavailable.
+
+Class imbalance handling
+- When using XGBoost, scale_pos_weight is computed from the training labels per fold.
+
+Validation
+- 5-fold CV is used.
+- Optional Group CV mode (StratifiedGroupKFold when available) uses the metadata column split to reduce leakage across split folders.
+
+Ensembling
+- The pipeline can train multiple models with different random seeds and average their probabilities.
+
+Threshold selection
+- For each CV fold, an F1-optimal threshold is found.
+- For the ensemble, two common options exist:
+  - best threshold: maximize OOF F1 on the full out-of-fold predictions
+  - median threshold: median of per-fold best thresholds (often more robust)
+- The final submission converts test probabilities to 0/1 using the chosen threshold.
+
+Leaderboard-tuning option
+- The script can optionally choose a threshold that yields a target number of positives in the test set.
+  This is a common trick for F1 competitions when the expected prevalence is known.
+
+
+5) How to run (local)
+---------------------
+Prerequisites
+- Python 3.10+ recommended
+- Required packages:
+  - numpy
+  - pandas
+  - scikit-learn
+- Optional (recommended): xgboost
+
+Install deps (example)
+- pip install numpy pandas scikit-learn
+- pip install xgboost
+
+Run
+1) Ensure you have the data folder next to mallorn.py:
+   MALLORN/mallorn-astronomical-classification-challenge/
+   containing train_log.csv, test_log.csv, and split_*/
+
+2) From the MALLORN/ directory:
+   python3 mallorn.py
+
+Output
+- Writes submission.csv in the current working directory.
+
+
+6) How to run (Kaggle)
+----------------------
+The script auto-detects the Kaggle input mount:
+- /kaggle/input/mallorn-astronomical-classification-challenge
+
+In a Kaggle notebook, you can typically run:
+- !python mallorn.py
+
+
+7) Useful environment variables
+-------------------------------
+Data location
+- MALLORN_DATA_DIR
+  Path to the folder that contains train_log.csv and test_log.csv.
+
+Cross-validation behavior
+- MALLORN_GROUP_CV
+  If set to 1/true/yes, uses split as a grouping variable for CV.
+
+Ensembling
+- MALLORN_SEEDS
+  Comma-separated seeds, e.g.: 42,43,44
+- MALLORN_N_SEEDS
+  If MALLORN_SEEDS is not set, number of seeds to use (default: 3).
+
+Threshold behavior
+- MALLORN_THR_MODE
+  best (default) or median
+- MALLORN_TARGET_POS
+  Integer. If set, overrides threshold to yield approximately that many predicted positives on the test set.
+
+
+8) Reproducibility notes
+------------------------
+- Results may vary slightly depending on:
+  - whether xgboost is installed (preferred) or sklearn fallback is used
+  - the number of seeds used for ensembling
+  - whether Group CV is enabled
+  - the chosen thresholding mode
+
+- The pipeline prints out:
+  - fold completion
+  - OOF F1 scores and thresholds
+  - a threshold sweep for several target positive counts
+  - the final predicted positive count on the test set
+
+
+9) Quick sanity checks
+----------------------
+After running, confirm:
+- submission.csv exists
+- header is exactly: object_id,prediction
+- prediction values are only 0 or 1
+- number of rows equals the number of objects in test_log.csv
+
+
+End of document
