@@ -139,6 +139,32 @@ def _linear_regression_1d(x: np.ndarray, y: np.ndarray) -> tuple[float, float, f
     return slope, intercept, r2
 
 
+def _threshold_for_target_positives(proba: np.ndarray, target_pos: int) -> float:
+    """Pick a threshold that yields approximately `target_pos` positives."""
+    p = np.asarray(proba, dtype=np.float64)
+    n = p.size
+    if n == 0:
+        return 0.5
+    target_pos = int(np.clip(target_pos, 0, n))
+    if target_pos == 0:
+        return float(np.nanmax(p) + 1e-12)
+    if target_pos == n:
+        return float(np.nanmin(p) - 1e-12)
+    # kth largest => threshold at (n - target_pos)
+    kth = int(n - target_pos)
+    thr = float(np.partition(p, kth)[kth])
+    return thr
+
+
+def _print_threshold_sweep(proba: np.ndarray, targets: list[int]) -> None:
+    p = np.asarray(proba, dtype=np.float64)
+    print("Threshold sweep (target positives -> threshold):")
+    for t in targets:
+        thr = _threshold_for_target_positives(p, int(t))
+        pred = (p >= thr)
+        print(f"  {int(t):5d} -> thr={thr:.6f} | pos={int(pred.sum())}")
+
+
 def _weighted_mean(x: pd.Series, err: pd.Series) -> float:
     w = 1.0 / (err.replace(0, np.nan) ** 2)
     num = (w * x).sum(skipna=True)
@@ -211,7 +237,13 @@ def extract_lightcurve_features(lightcurves: pd.DataFrame, ebv_map: pd.Series | 
     )
 
     # Weighted mean per filter
-    wmean = gf.apply(lambda g: _weighted_mean(g["Flux_corr"], g["Flux_err_corr"]))
+    def _wmean_apply(g: pd.DataFrame) -> float:
+        return _weighted_mean(g["Flux_corr"], g["Flux_err_corr"])
+
+    try:
+        wmean = gf.apply(_wmean_apply, include_groups=False)
+    except TypeError:
+        wmean = gf.apply(_wmean_apply)
     wmean.name = "flux_wmean"
 
     # Skew/kurt per filter
@@ -358,7 +390,10 @@ def extract_lightcurve_features(lightcurves: pd.DataFrame, ebv_map: pd.Series | 
             }
         )
 
-    adv = gf.apply(_advanced_features)
+    try:
+        adv = gf.apply(_advanced_features, include_groups=False)
+    except TypeError:
+        adv = gf.apply(_advanced_features)
 
     # Linear slope in corrected flux vs t0
     sums = gf.agg(
@@ -423,9 +458,15 @@ def extract_lightcurve_features(lightcurves: pd.DataFrame, ebv_map: pd.Series | 
                 diffs.append(out[ca] - out[cb])
         if diffs:
             mat = np.vstack([d.to_numpy(dtype=np.float64) for d in diffs])
-            out[f"color_{nm}_bin_min"] = np.nanmin(mat, axis=0)
-            out[f"color_{nm}_bin_max"] = np.nanmax(mat, axis=0)
-            out[f"color_{nm}_bin_mean"] = np.nanmean(mat, axis=0)
+            valid = ~np.isnan(mat)
+            # Avoid RuntimeWarnings on all-NaN columns by using where+initial.
+            vmin = np.nanmin(mat, axis=0, where=valid, initial=0.0)
+            vmax = np.nanmax(mat, axis=0, where=valid, initial=0.0)
+            cnt = np.sum(valid, axis=0)
+            vmean = np.where(cnt > 0, np.nansum(mat, axis=0) / np.maximum(cnt, 1), 0.0)
+            out[f"color_{nm}_bin_min"] = vmin
+            out[f"color_{nm}_bin_max"] = vmax
+            out[f"color_{nm}_bin_mean"] = vmean
 
     return out
 
@@ -440,10 +481,10 @@ def _prep_meta(log_df: pd.DataFrame) -> pd.DataFrame:
         df["Z_err_missing"] = df["Z_err"].isna().astype(np.int8)
         df["Z_err"] = df["Z_err"].fillna(0.0)
 
-    # Keep split for feature-building, but also one-hot it for the model
+    # Keep raw split for grouped CV; do NOT one-hot encode it.
+    # Using split as a feature can overfit to split-specific artifacts.
     if "split" in df.columns:
-        split_dummies = pd.get_dummies(df["split"].astype("string"), prefix="split", dummy_na=False)
-        df = pd.concat([df.drop(columns=["split"], errors="ignore"), split_dummies], axis=1)
+        df["split"] = df["split"].astype("string")
 
     df = df.drop(columns=[c for c in ["SpecType", "English Translation"] if c in df.columns], errors="ignore")
     return df
@@ -568,6 +609,7 @@ def cross_validated_oof_and_test_proba(
     X: pd.DataFrame,
     y: np.ndarray,
     X_test: pd.DataFrame,
+    groups: np.ndarray | None = None,
     n_splits: int = 5,
     seed: int = 42,
 ) -> tuple[CVResult, np.ndarray]:
@@ -581,8 +623,23 @@ def cross_validated_oof_and_test_proba(
     best_iters: list[int] = []
     fold_thresholds: list[float] = []
 
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_np, y), start=1):
+    if groups is not None:
+        try:
+            from sklearn.model_selection import StratifiedGroupKFold  # type: ignore
+
+            splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+            split_iter = splitter.split(X_np, y, groups)
+        except Exception:
+            # Fallback: group-only split (not stratified)
+            from sklearn.model_selection import GroupKFold
+
+            splitter = GroupKFold(n_splits=n_splits)
+            split_iter = splitter.split(X_np, y, groups)
+    else:
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        split_iter = splitter.split(X_np, y)
+
+    for fold, (tr_idx, va_idx) in enumerate(split_iter, start=1):
         model = _make_model(y[tr_idx], seed=seed + fold)
         model, best_iter = _fit_with_optional_early_stopping(model, X_np[tr_idx], y[tr_idx], X_np[va_idx], y[va_idx])
         proba = model.predict_proba(X_np[va_idx])[:, 1]
@@ -609,6 +666,27 @@ def cross_validated_oof_and_test_proba(
     )
     test_mean = test_sum / float(n_splits)
     return cv, test_mean
+
+
+def _parse_seeds() -> list[int]:
+    """Parse ensemble seeds from env.
+
+    - If MALLORN_SEEDS is set (comma-separated ints), use it.
+    - Else use MALLORN_N_SEEDS (default 3) starting from base seed 42.
+    """
+    raw = os.environ.get("MALLORN_SEEDS", "").strip()
+    if raw:
+        out: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            out.append(int(part))
+        return out or [42]
+
+    n = int(os.environ.get("MALLORN_N_SEEDS", "3").strip() or "3")
+    n = max(1, min(n, 10))
+    return [42 + i for i in range(n)]
 
 
 def train_full_and_predict(X_train: pd.DataFrame, y: np.ndarray, X_test: pd.DataFrame, seed: int = 42, n_estimators: int | None = None) -> np.ndarray:
@@ -646,8 +724,13 @@ def main() -> None:
 
     y = train["target"].to_numpy(dtype=np.int8)
 
-    X_train = train.drop(columns=["object_id", "target"], errors="ignore")
-    X_test = test.drop(columns=["object_id"], errors="ignore")
+    # Optional grouped CV (recommended when you suspect split-specific artifacts).
+    use_group_cv = os.environ.get("MALLORN_GROUP_CV", "0").strip().lower() in {"1", "true", "yes"}
+    groups = train["split"].to_numpy() if (use_group_cv and "split" in train.columns) else None
+
+    # drop split from the feature matrix; we only use it as a grouping variable
+    X_train = train.drop(columns=["object_id", "target", "split"], errors="ignore")
+    X_test = test.drop(columns=["object_id", "split"], errors="ignore")
 
     # Align columns and fill missing with 0
     X_train, X_test = X_train.align(X_test, join="left", axis=1, fill_value=0.0)
@@ -658,14 +741,54 @@ def main() -> None:
 
     print(f"Train shape: {X_train.shape} | Test shape: {X_test.shape} | Pos rate: {y.mean():.4f}")
 
-    cv, test_proba = cross_validated_oof_and_test_proba(X_train, y, X_test, n_splits=5, seed=42)
-    print(f"CV best threshold (global OOF): {cv.best_threshold:.5f} | OOF F1: {cv.cv_f1_at_best_threshold:.5f}")
-    print(f"CV median fold threshold: {cv.best_threshold_median:.5f} | OOF F1: {cv.cv_f1_at_median_threshold:.5f}")
-    if cv.best_iterations_mean is not None:
-        print(f"Mean best_iteration (XGB): {cv.best_iterations_mean}")
+    seeds = _parse_seeds()
+    print(f"Ensembling over seeds: {seeds} | GroupCV: {use_group_cv}")
+
+    oof_sum = np.zeros(len(y), dtype=np.float64)
+    test_sum = np.zeros(X_test.shape[0], dtype=np.float64)
+    med_thrs: list[float] = []
+    best_iters: list[int] = []
+
+    for s in seeds:
+        cv, test_proba_s = cross_validated_oof_and_test_proba(X_train, y, X_test, groups=groups, n_splits=5, seed=int(s))
+        print(f"seed {s}: OOF F1 best={cv.cv_f1_at_best_threshold:.5f} | median_thr={cv.best_threshold_median:.5f}")
+        oof_sum += cv.oof_proba.astype(np.float64)
+        test_sum += test_proba_s.astype(np.float64)
+        med_thrs.append(float(cv.best_threshold_median))
+        if cv.best_iterations_mean is not None:
+            best_iters.append(int(cv.best_iterations_mean))
+
+    oof_mean = (oof_sum / float(len(seeds))).astype(np.float32)
+    test_proba = (test_sum / float(len(seeds))).astype(np.float32)
+
+    thr_global, f1_global = _find_best_threshold(y, oof_mean)
+    thr_med = float(np.median(np.asarray(med_thrs, dtype=np.float64))) if med_thrs else float(thr_global)
+    f1_med = _f1_score_np(y, (oof_mean >= thr_med).astype(np.int8))
+    print(f"Ensemble OOF best threshold: {thr_global:.5f} | OOF F1: {f1_global:.5f}")
+    print(f"Ensemble median threshold: {thr_med:.5f} | OOF F1: {f1_med:.5f}")
+    if best_iters:
+        print(f"Mean best_iteration (XGB): {int(np.mean(best_iters))}")
 
     # Robust choice used by multiple top solutions: median of fold-wise thresholds
-    chosen_thr = cv.best_threshold_median
+    thr_mode = os.environ.get("MALLORN_THR_MODE", "best").strip().lower()
+    if thr_mode in {"median", "med"}:
+        chosen_thr = thr_med
+    else:
+        # default: maximize OOF F1
+        chosen_thr = float(thr_global)
+
+    # Optional: override threshold by targeting a specific number of positives.
+    # This is a common leaderboard-tuning trick for F1 competitions.
+    target_pos = os.environ.get("MALLORN_TARGET_POS", "").strip()
+    if target_pos:
+        try:
+            chosen_thr = _threshold_for_target_positives(test_proba, int(target_pos))
+            print(f"Using MALLORN_TARGET_POS={int(target_pos)} => threshold={chosen_thr:.6f}")
+        except Exception:
+            print("Warning: invalid MALLORN_TARGET_POS; ignoring.")
+
+    # Print a small sweep around typical ranges seen in top writeups.
+    _print_threshold_sweep(test_proba, targets=[350, 400, 415, 450, 500, 550, 600])
     test_pred = (test_proba >= chosen_thr).astype(np.int8)
     print(f"Predicted positives in test: {int(test_pred.sum())} (threshold={chosen_thr:.5f})")
 
