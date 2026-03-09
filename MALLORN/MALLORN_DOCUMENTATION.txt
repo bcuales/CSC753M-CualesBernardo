@@ -1,7 +1,7 @@
 MALLORN Astronomical Classification Challenge — Documentation
 ========================================================
 
-Author/Repo: CSC753M-CualesBernardo (folder: MALLORN/)
+Authors: CUALES, Bianca Mari, BERNARDO, Noah H.
 Last updated: 2026-03-09
 
 
@@ -197,5 +197,3 @@ After running, confirm:
 - prediction values are only 0 or 1
 - number of rows equals the number of objects in test_log.csv
 
-
-End of document
